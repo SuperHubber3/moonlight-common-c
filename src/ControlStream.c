@@ -140,6 +140,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_MOTION_EVENT 10
 #define IDX_SET_RGB_LED 11
 #define IDX_DS_ADAPTIVE_TRIGGERS 12
+#define IDX_CLIPBOARD 13
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -157,6 +158,8 @@ static const short packetTypesGen3[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -171,6 +174,8 @@ static const short packetTypesGen4[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -185,6 +190,8 @@ static const short packetTypesGen5[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -199,6 +206,8 @@ static const short packetTypesGen7[] = {
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Clipboard (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -214,6 +223,7 @@ static const short packetTypesGen7Enc[] = {
     0x5501, // Set motion event (Sunshine protocol extension)
     0x5502, // Set RGB LED (Sunshine protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
+    0x5505, // Clipboard (Sunshine protocol extension, 0x5504 is used for player LEDs)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -413,6 +423,11 @@ static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) 
 
 // Request an IDR frame on demand by the decoder
 void LiRequestIdrFrame(void) {
+    // Every frame is independently decodable with intra-only codecs, so there's nothing to request
+    if (VIDEO_FORMAT_IS_INTRA_ONLY(NegotiatedVideoFormat)) {
+        return;
+    }
+
     // Any reference frame invalidation requests should be dropped now.
     // We require a full IDR frame to recover.
     freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
@@ -689,7 +704,7 @@ static bool isPacketSentWaitingForAck(ENetPacket* packet) {
     return false;
 }
 
-static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+static bool sendMessageEnet(short ptype, unsigned short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     ENetPacket* enetPacket;
     int err;
 
@@ -703,12 +718,24 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     if (encryptedControlStream) {
         PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
         PNVCTL_ENET_PACKET_HEADER_V2 packet;
-        char tempBuffer[256];
+        char stackBuffer[256];
+        char* tempBuffer = stackBuffer;
+
+        // Most messages are tiny, but clipboard messages can be much larger
+        if (sizeof(*packet) + paylen > sizeof(stackBuffer)) {
+            tempBuffer = malloc(sizeof(*packet) + paylen);
+            if (tempBuffer == NULL) {
+                return false;
+            }
+        }
 
         enetPacket = enet_packet_create(NULL,
                                         sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
                                         flags);
         if (enetPacket == NULL) {
+            if (tempBuffer != stackBuffer) {
+                free(tempBuffer);
+            }
             return false;
         }
 
@@ -722,14 +749,17 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
         encPacket->seq = currentEnetSequenceNumber++;
 
         // Construct the plaintext data for encryption
-        LC_ASSERT(sizeof(*packet) + paylen < sizeof(tempBuffer));
         packet = (PNVCTL_ENET_PACKET_HEADER_V2)tempBuffer;
         packet->type = ptype;
         packet->payloadLength = paylen;
         memcpy(&packet[1], payload, paylen);
 
         // Encrypt the data into the final packet (and byteswap for BE machines)
-        if (!encryptControlMessage(encPacket, packet)) {
+        bool encrypted = encryptControlMessage(encPacket, packet);
+        if (tempBuffer != stackBuffer) {
+            free(tempBuffer);
+        }
+        if (!encrypted) {
             Limelog("Failed to encrypt control stream message\n");
             enet_packet_destroy(enetPacket);
             PltUnlockMutex(&enetMutex);
@@ -843,7 +873,7 @@ static bool sendMessageTcp(short ptype, short paylen, const void* payload) {
     return true;
 }
 
-static bool sendMessageAndForget(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+static bool sendMessageAndForget(short ptype, unsigned short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     bool ret;
 
     // Unlike regular sockets, ENet sockets aren't safe to invoke from multiple
@@ -858,7 +888,7 @@ static bool sendMessageAndForget(short ptype, short paylen, const void* payload,
     return ret;
 }
 
-static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+static bool sendMessageAndDiscardReply(short ptype, unsigned short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     if (AppVersionQuad[0] >= 5) {
         if (!sendMessageEnet(ptype, paylen, payload, channelId, flags, moreData)) {
             return false;
@@ -1292,8 +1322,13 @@ static void controlReceiveThreadFunc(void* context) {
                 hdrEnabled = (enableByte != 0);
             }
 
+            // Clipboard messages are passed directly to the client. They arrive in large
+            // bursts that would overflow the bounded async callback queue.
+            if (ctlHdr->type == packetTypes[IDX_CLIPBOARD]) {
+                ListenerCallbacks.clipboardMessage((const uint8_t*)(ctlHdr + 1), (uint32_t)(packetLength - sizeof(*ctlHdr)));
+            }
             // Process client callbacks in a separate thread
-            if (needsAsyncCallback(ctlHdr->type)) {
+            else if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
@@ -1695,6 +1730,29 @@ int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t chan
 
     // Send the input data (no reply expected)
     if (sendMessageAndForget(packetTypes[IDX_INPUT_DATA], length, data, channelId, flags, moreData) == 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int LiSendClipboardMessage(const uint8_t* data, uint32_t length) {
+    // Clipboard contents must never be sent in the clear
+    if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_CLIPBOARD) || !encryptedControlStream ||
+            packetTypes[IDX_CLIPBOARD] == -1) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    if (length == 0 || length > LI_CLIPBOARD_MESSAGE_MAX) {
+        return -1;
+    }
+
+    if (peer == NULL || stopping) {
+        return -1;
+    }
+
+    if (!sendMessageAndForget(packetTypes[IDX_CLIPBOARD], (unsigned short)length, data,
+                              CTRL_CHANNEL_CLIPBOARD, ENET_PACKET_FLAG_RELIABLE, false)) {
         return -1;
     }
 

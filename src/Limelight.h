@@ -233,12 +233,24 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_AV1_HIGH8_444   0x4000 // AV1 High 4:4:4 8-bit profile
 #define VIDEO_FORMAT_AV1_HIGH10_444  0x8000 // AV1 High 4:4:4 10-bit profile
 
+// PyroWave is an intra-only wavelet codec (Sunshine extension). Every frame is independently
+// decodable, so the client never needs to request IDR frames or RFI. The decoded planes are
+// always full range with centered chroma. SDR is BT.709, HDR is BT.2020 NCL with PQ transfer.
+#define VIDEO_FORMAT_PYROWAVE         0x10000 // PyroWave 4:2:0 SDR
+#define VIDEO_FORMAT_PYROWAVE_HDR     0x20000 // PyroWave 4:2:0 HDR10
+#define VIDEO_FORMAT_PYROWAVE_444     0x40000 // PyroWave 4:4:4 SDR
+#define VIDEO_FORMAT_PYROWAVE_444_HDR 0x80000 // PyroWave 4:4:4 HDR10
+
 // Masks for clients to use to match video codecs without profile-specific details.
-#define VIDEO_FORMAT_MASK_H264   0x000F
-#define VIDEO_FORMAT_MASK_H265   0x0F00
-#define VIDEO_FORMAT_MASK_AV1    0xF000
-#define VIDEO_FORMAT_MASK_10BIT  0xAA00
-#define VIDEO_FORMAT_MASK_YUV444 0xCC04
+#define VIDEO_FORMAT_MASK_H264     0x000F
+#define VIDEO_FORMAT_MASK_H265     0x0F00
+#define VIDEO_FORMAT_MASK_AV1      0xF000
+#define VIDEO_FORMAT_MASK_PYROWAVE 0xF0000
+#define VIDEO_FORMAT_MASK_10BIT    0xAAA00
+#define VIDEO_FORMAT_MASK_YUV444   0xCCC04
+
+// Returns true if every frame of this video format is an intra frame (no IDR frame requests needed)
+#define VIDEO_FORMAT_IS_INTRA_ONLY(x) (((x) & VIDEO_FORMAT_MASK_PYROWAVE) != 0)
 
 // If set in the renderer capabilities field, this flag will cause audio/video data to
 // be submitted directly from the receive thread. This should only be specified if the
@@ -483,6 +495,11 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// This callback is invoked when the host sends a clipboard sync message (Sunshine extension,
+// see LI_FF_CLIPBOARD). The message contents are opaque to moonlight-common-c. The data buffer
+// is only valid for the duration of the callback.
+typedef void(*ConnListenerClipboardMessage)(const uint8_t* data, uint32_t length);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -497,6 +514,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerClipboardMessage clipboardMessage;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -513,13 +531,18 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 #define SCM_HEVC_REXT10_444 0x00100000 // Sunshine extension
 #define SCM_AV1_HIGH8_444   0x00200000 // Sunshine extension
 #define SCM_AV1_HIGH10_444  0x00400000 // Sunshine extension
+#define SCM_PYROWAVE         0x01000000 // Sunshine extension
+#define SCM_PYROWAVE_HDR     0x02000000 // Sunshine extension
+#define SCM_PYROWAVE_444     0x04000000 // Sunshine extension
+#define SCM_PYROWAVE_444_HDR 0x08000000 // Sunshine extension
 
 // SCM masks to identify various codec capabilities
-#define SCM_MASK_H264   (SCM_H264 | SCM_H264_HIGH8_444)
-#define SCM_MASK_HEVC   (SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444)
-#define SCM_MASK_AV1    (SCM_AV1_MAIN8 | SCM_AV1_MAIN10 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
-#define SCM_MASK_10BIT  (SCM_HEVC_MAIN10 | SCM_HEVC_REXT10_444 | SCM_AV1_MAIN10 | SCM_AV1_HIGH10_444)
-#define SCM_MASK_YUV444 (SCM_H264_HIGH8_444 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
+#define SCM_MASK_H264     (SCM_H264 | SCM_H264_HIGH8_444)
+#define SCM_MASK_HEVC     (SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444)
+#define SCM_MASK_AV1      (SCM_AV1_MAIN8 | SCM_AV1_MAIN10 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
+#define SCM_MASK_PYROWAVE (SCM_PYROWAVE | SCM_PYROWAVE_HDR | SCM_PYROWAVE_444 | SCM_PYROWAVE_444_HDR)
+#define SCM_MASK_10BIT    (SCM_HEVC_MAIN10 | SCM_HEVC_REXT10_444 | SCM_AV1_MAIN10 | SCM_AV1_HIGH10_444 | SCM_PYROWAVE_HDR | SCM_PYROWAVE_444_HDR)
+#define SCM_MASK_YUV444   (SCM_H264_HIGH8_444 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444 | SCM_PYROWAVE_444 | SCM_PYROWAVE_444_HDR)
 
 typedef struct _SERVER_INFORMATION {
     // Server host name or IP address in text form
@@ -1016,7 +1039,16 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_CLIPBOARD               0x04 // LiSendClipboardMessage() supported
 uint32_t LiGetHostFeatureFlags(void);
+
+// This function sends an opaque clipboard sync message to the host. It is only valid to call this
+// if the host supports LI_FF_CLIPBOARD. Messages are delivered reliably and in order, but must not
+// exceed LI_CLIPBOARD_MESSAGE_MAX bytes, so larger clipboard contents must be split by the caller.
+// This function may block for a few milliseconds, so don't call it from a latency-sensitive thread.
+// It must not be called concurrently with or after LiStopConnection(). This is a Sunshine protocol extension.
+#define LI_CLIPBOARD_MESSAGE_MAX 32768
+int LiSendClipboardMessage(const uint8_t* data, uint32_t length);
 
 #ifdef __cplusplus
 }

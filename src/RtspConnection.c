@@ -1087,7 +1087,21 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             goto Exit;
         }
 
-        if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) && strstr(response.payload, "AV1/90000")) {
+        if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) && (serverInfo->serverCodecModeSupport & SCM_MASK_PYROWAVE)) {
+            if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_444_HDR) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_444_HDR)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_444_HDR;
+            }
+            else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_HDR) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HDR)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HDR;
+            }
+            else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_444)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_444;
+            }
+            else {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+            }
+        }
+        else if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) && strstr(response.payload, "AV1/90000")) {
             if ((serverInfo->serverCodecModeSupport & SCM_AV1_HIGH10_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_HIGH10_444)) {
                 NegotiatedVideoFormat = VIDEO_FORMAT_AV1_HIGH10_444;
             }
