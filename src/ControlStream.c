@@ -1736,6 +1736,21 @@ int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t chan
     return 0;
 }
 
+// ENet stops sending reliable messages of all channels while its reliable window is full, so
+// clipboard data only fills part of it to never delay other control messages or input.
+// Must be called with enetMutex held.
+static bool hasRoomForClipboardData(uint32_t length) {
+    size_t pending = peer->reliableDataInTransit;
+    for (ENetListIterator node = enet_list_begin(&peer->outgoingSendReliableCommands);
+         node != enet_list_end(&peer->outgoingSendReliableCommands);
+         node = enet_list_next(node)) {
+        pending += ((ENetOutgoingCommand*)node)->fragmentLength;
+    }
+
+    size_t window = (size_t)peer->packetThrottle * peer->windowSize / ENET_PEER_PACKET_THROTTLE_SCALE;
+    return pending == 0 || pending + length <= window * 3 / 4;
+}
+
 int LiSendClipboardMessage(const uint8_t* data, uint32_t length) {
     // Clipboard contents must never be sent in the clear
     if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_CLIPBOARD) || !encryptedControlStream ||
@@ -1747,8 +1762,20 @@ int LiSendClipboardMessage(const uint8_t* data, uint32_t length) {
         return -1;
     }
 
-    if (peer == NULL || stopping) {
-        return -1;
+    // Wait for room in the reliable window, for up to a second
+    for (int i = 0;; i++) {
+        PltLockMutex(&enetMutex);
+        bool connected = peer != NULL && !stopping;
+        bool room = connected && hasRoomForClipboardData(length);
+        PltUnlockMutex(&enetMutex);
+
+        if (!connected || (!room && i >= 1000)) {
+            return -1;
+        }
+        else if (room) {
+            break;
+        }
+        PltSleepMs(1);
     }
 
     if (!sendMessageAndForget(packetTypes[IDX_CLIPBOARD], (unsigned short)length, data,
